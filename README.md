@@ -1,1 +1,1 @@
-# mgnet_tf
+# MgNet_SCAN
