@@ -7,7 +7,7 @@ parser.add_argument("--u-channels", type = str, required = True, help = "number 
 parser.add_argument("--f-channels", type = str, required = True, help = "number of channels for f convolution.  In the format 2,2,2,2 in which layer channels are comma separated")
 parser.add_argument("--batch-size", type = int, required = True, help = "number of samples for each batch")
 parser.add_argument("--epochs", type = int, required = True, help = "maximum number of epochs during training")
-parser.add_argument("--lr", type = float, required = True, help = "learning rate for Adam optimizer")
+parser.add_argument("--lr", type = float, required = True, help = "learning rate for SGD optimizer")
 parser.add_argument("--graph", type = bool, required = True, help = "whether or not to generate loss/accuracy graph")
 args = parser.parse_args()
 
@@ -18,13 +18,22 @@ f_channels = args.f_channels
 batch_size = args.batch_size
 epochs = args.epochs
 lr = args.lr
+lr_step = args.lr_step
+momentum = args.momentum
+wd = args.wd
 graph = args.graph
 
 iterations = [int(x) for x in iterations.split(",")]
 u_channels = [int(x) for x in u_channels.split(",")]
 f_channels = [int(x) for x in f_channels.split(",")]
 
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 import tensorflow as tf
+import numpy as np
+import logging
+tf.get_logger().setLevel(logging.ERROR)
+import tensorflow_addons as tfa
 import tensorflow_datasets as tfds
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -72,6 +81,59 @@ ds_test = preprocess(ds_test, training = False)
 
 
 
+class HeUniform(tf.keras.initializers.Initializer):
+  
+  def __init__(self, a, mode, nonlinearity, bound = None):
+    self.a = a
+    self.mode = mode
+    self.nonlinearity = nonlinearity
+    self.bound = bound
+    
+    if self.nonlinearity == "sigmoid":
+      self.gain = 1
+    elif self.nonlinearity == "tanh":
+      self.gain = 5.0 / 3
+    elif self.nonlinearity == "relu":
+      self.gain = np.sqrt(2.0)
+    elif self.nonlinearity == "leaky_relu":
+      if self.a is None:
+        self.gain = .01
+      else:
+        self.gain = np.sqrt(2.0 / (1 + self.a ** 2))
+    elif self.nonlinearity == "selu":
+      self.gain = 3.0 / 4
+    
+  def __call__(self, shape, dtype = None, **kwargs):
+    if self.bound:
+      return tf.random.uniform(shape,
+                               minval = -self.bound,
+                               maxval = self.bound)
+    
+    torch_shape = np.flip(shape)
+    
+    num_input_fmaps = torch_shape[1]
+    num_output_fmaps = torch_shape[0]
+    receptive_field_size = 1
+    if len(torch_shape) > 2:
+      for s in torch_shape[2:]:
+        receptive_field_size *= s
+    fan_in = num_input_fmaps * receptive_field_size    
+    fan_out = num_output_fmaps * receptive_field_size
+    
+    if self.mode == "fan_in":
+      fan = fan_in
+    elif self.mode == "fan_out":
+      fan = fan_out
+      
+    std = self.gain / np.sqrt(fan)
+    bound = np.sqrt(3.0) * std
+    
+    return tf.random.uniform(shape,
+                             minval = -bound,
+                             maxval = bound)
+
+
+
 class MgSmooth(tf.keras.layers.Layer):
 
   def __init__(self, iterations, u_channels, f_channels):
@@ -83,18 +145,30 @@ class MgSmooth(tf.keras.layers.Layer):
                                     strides = (1, 1),
                                     padding = "same",
                                     use_bias = False,
-                                    kernel_initializer = "he_uniform")
+                                    kernel_initializer = 
+                                      HeUniform(np.sqrt(5),
+                                                "fan_in",
+                                                "leaky_relu"),
+                                    kernel_regularizer = 
+                                      tf.keras.regularizers.L2(wd))
     self.B = tf.keras.layers.Conv2D(f_channels,
                                     (3, 3),
                                     strides = (1, 1),
                                     padding = "same",
                                     use_bias = False,
-                                    kernel_initializer = "he_uniform")
+                                    kernel_initializer = 
+                                      HeUniform(np.sqrt(5),
+                                                "fan_in",
+                                                "leaky_relu"),
+                                    kernel_regularizer = 
+                                      tf.keras.regularizers.L2(wd))
 
     self.A_bns, self.B_bns = [], []
     for _ in range(self.iterations):
-      self.A_bns.append(tf.keras.layers.BatchNormalization())
-      self.B_bns.append(tf.keras.layers.BatchNormalization())
+      self.A_bns.append(tf.keras.layers.BatchNormalization(momentum = .9,
+                                                           epsilon = 1e-5))
+      self.B_bns.append(tf.keras.layers.BatchNormalization(momentum = .9,
+                                                           epsilon = 1e-5))
 
   def call(self, u, f):
     for i in range(self.iterations):
@@ -113,18 +187,30 @@ class MgBlock(tf.keras.layers.Layer):
                                      strides = (2, 2),
                                      padding = "same",
                                      use_bias = False,
-                                     kernel_initializer = "he_uniform")
+                                     kernel_initializer = 
+                                       HeUniform(np.sqrt(5),
+                                                 "fan_in",
+                                                 "leaky_relu"),
+                                     kernel_regularizer = 
+                                       tf.keras.regularizers.L2(wd))
     self.R = tf.keras.layers.Conv2D(f_channels,
                                     (3, 3),
                                     strides = (2, 2),
                                     padding = "same",
                                     use_bias = False,
-                                    kernel_initializer = "he_uniform")
+                                    kernel_initializer = 
+                                      HeUniform(np.sqrt(5),
+                                                "fan_in",
+                                                "leaky_relu"),
+                                    kernel_regularizer = 
+                                      tf.keras.regularizers.L2(wd))
     self.A_old = A_old
     self.MgSmooth = MgSmooth(self.iterations, u_channels, f_channels)
 
-    self.Pi_bn = tf.keras.layers.BatchNormalization()
-    self.R_bn = tf.keras.layers.BatchNormalization()
+    self.Pi_bn = tf.keras.layers.BatchNormalization(momentum = .9,
+                                                    epsilon = 1e-5)
+    self.R_bn = tf.keras.layers.BatchNormalization(momentum = .9,
+                                                   epsilon = 1e-5)
 
   def call(self, u0, f0):
     u1 = tf.nn.relu(self.Pi_bn(self.Pi(u0)))
@@ -145,8 +231,14 @@ class MgNet(tf.keras.Model):
                                          strides = (1, 1),
                                          padding = "same",
                                          use_bias = False,
-                                         kernel_initializer = "he_uniform")
-    self.A_bn = tf.keras.layers.BatchNormalization()
+                                         kernel_initializer = 
+                                           HeUniform(np.sqrt(5),
+                                                     "fan_in",
+                                                     "leaky_relu"),
+                                         kernel_regularizer = 
+                                           tf.keras.regularizers.L2(wd))
+    self.A_bn = tf.keras.layers.BatchNormalization(momentum = .9,
+                                                   epsilon = 1e-5)
 
     self.blocks = []
     for i in range(len(self.iterations)):
@@ -171,7 +263,17 @@ class MgNet(tf.keras.Model):
       x = ((x + 2 - 3) // 2) + 1
     self.pool = tf.keras.layers.AveragePooling2D(pool_size = (x, x))
     self.fc = tf.keras.layers.Dense(out_shape,
-                                    activation = "softmax")
+                                    kernel_initializer = 
+                                      HeUniform(np.sqrt(5),
+                                                "fan_in",
+                                                "leaky_relu"),
+                                    bias_initializer = 
+                                      HeUniform(np.sqrt(5),
+                                                "fan_in",
+                                                "leaky_relu",
+                                                1 / np.sqrt(u_channels[-1])),
+                                    kernel_regularizer = 
+                                      tf.keras.regularizers.L2(wd))
   
   def call(self, u0):
     f = tf.nn.relu(self.A_bn(self.A_init(u0)))
@@ -186,23 +288,43 @@ class MgNet(tf.keras.Model):
 
 
 
+def lr_schedule(epoch, lr):
+  if (epoch + 1) % epoch_step == 0:
+    return lr / lr_step
+  return lr
+
 tf.debugging.set_log_device_placement(True)
 gpus = tf.config.list_logical_devices("GPU")
 strategy = tf.distribute.MirroredStrategy(gpus)
 with strategy.scope():
-  model = MgNet(iterations,
-                u_channels,
-                f_channels,
-                ds_info.features["image"].shape,
-                ds_info.features["label"].num_classes)
+  model = MgNet(iterations = iterations,
+                u_channels = u_channels,
+                f_channels = f_channels,
+                in_shape = ds_info.features["image"].shape,
+                out_shape = ds_info.features["label"].num_classes)
 
-  loss = tf.keras.losses.SparseCategoricalCrossentropy()
-  optimizer = tf.keras.optimizers.Adam(lr)
-  model.compile(optimizer = optimizer, loss = loss, metrics = ["accuracy"])
+  loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits = True)
+  
+  log_dir = "logs/tensorflow/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+  tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir = log_dir,
+                                                        histogram_freq = 1)
+
+  lr_s = tf.keras.callbacks.LearningRateScheduler(lr_schedule)
+  # optimizer = tfa.optimizers.SGDW(learning_rate = lr,
+  #                                 weight_decay = wd,
+  #                                 momentum = momentum)
+  optimizer = tf.keras.optimizers.SGD(learning_rate = lr,
+                                      momentum = momentum)
+  
+  model.compile(optimizer = optimizer,
+                loss = loss,
+                metrics = ["accuracy"])
 
   history = model.fit(ds_train,
                       epochs = epochs,
-                      validation_data = ds_test)
+                      validation_data = ds_test,
+                      callbacks = [lr_s,
+                                   tensorboard_callback])
 
 model.summary()
 
