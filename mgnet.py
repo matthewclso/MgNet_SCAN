@@ -32,24 +32,45 @@ from datetime import datetime
 (ds_train, ds_test), ds_info = tfds.load(
     dataset,
     split = ["train", "test"],
-    shuffle_files = True,
     as_supervised = True,
-    with_info = True
-)
+    with_info = True)
 
-def preprocess(ds):
-  def normalize_img(image, label):
-    return tf.cast(image, tf.float32) / 255., label
+rescale = tf.keras.layers.Rescaling(1. / 255)
+if dataset == "mnist":
+  mean, variance = [.1307], np.square([.3081])
+if dataset == "cifar10":
+  mean, variance = [.4914, .4822, .4465], np.square([.2023, .1994, .2010])
+if dataset == "cifar100":
+  mean, variance = [.5071, .4865, .4409], np.square([.2673, .2564, .2762])
+normalize = tf.keras.layers.Normalization(mean = mean,
+                                          variance = variance)
 
-  ds = ds.map(normalize_img, num_parallel_calls = tf.data.AUTOTUNE)
-  ds = ds.cache()
+def preprocess(ds, training):
+  if training:
+    layers = tf.keras.Sequential([
+      rescale,
+      tf.keras.layers.RandomTranslation(height_factor = .125,
+                                        width_factor = .125,
+                                        fill_mode = "constant"),
+      tf.keras.layers.RandomFlip(mode = "horizontal"),
+      normalize
+    ])
+    ds = ds.shuffle(ds_info.splits["train"].num_examples)
+  else:
+    layers = tf.keras.Sequential([rescale, normalize])
+
   ds = ds.batch(batch_size)
+  ds = ds.map(lambda x, y: (layers(x), y),
+              num_parallel_calls = tf.data.AUTOTUNE)
+  ds = ds.cache()
   ds = ds.prefetch(tf.data.AUTOTUNE)
 
   return ds
 
-ds_train = preprocess(ds_train)
-ds_test = preprocess(ds_test)
+ds_train = preprocess(ds_train, training = True)
+ds_test = preprocess(ds_test, training = False)
+
+
 
 class MgSmooth(tf.keras.layers.Layer):
 
@@ -57,13 +78,23 @@ class MgSmooth(tf.keras.layers.Layer):
     super(MgSmooth, self).__init__()
 
     self.iterations = iterations
-    self.A = tf.keras.layers.Conv2D(u_channels, (3, 3), strides = (1, 1), padding = "same", use_bias = False)
-    self.B = tf.keras.layers.Conv2D(f_channels, (3, 3), strides = (1, 1), padding = "same", use_bias = False)
+    self.A = tf.keras.layers.Conv2D(u_channels,
+                                    (3, 3),
+                                    strides = (1, 1),
+                                    padding = "same",
+                                    use_bias = False,
+                                    kernel_initializer = "he_uniform")
+    self.B = tf.keras.layers.Conv2D(f_channels,
+                                    (3, 3),
+                                    strides = (1, 1),
+                                    padding = "same",
+                                    use_bias = False,
+                                    kernel_initializer = "he_uniform")
 
     self.A_bns, self.B_bns = [], []
     for _ in range(self.iterations):
-      self.A_bns.append(tf.keras.layers.BatchNormalization(axis = 1))
-      self.B_bns.append(tf.keras.layers.BatchNormalization(axis = 1))
+      self.A_bns.append(tf.keras.layers.BatchNormalization())
+      self.B_bns.append(tf.keras.layers.BatchNormalization())
 
   def call(self, u, f):
     for i in range(self.iterations):
@@ -77,17 +108,27 @@ class MgBlock(tf.keras.layers.Layer):
     super(MgBlock, self).__init__()
 
     self.iterations = iterations
-    self.Pi = tf.keras.layers.Conv2D(u_channels, (3, 3), strides = (2, 2), padding = "same", use_bias = False)
-    self.R = tf.keras.layers.Conv2D(f_channels, (3, 3), strides = (2, 2), padding = "same", use_bias = False)
+    self.Pi = tf.keras.layers.Conv2D(u_channels,
+                                     (3, 3),
+                                     strides = (2, 2),
+                                     padding = "same",
+                                     use_bias = False,
+                                     kernel_initializer = "he_uniform")
+    self.R = tf.keras.layers.Conv2D(f_channels,
+                                    (3, 3),
+                                    strides = (2, 2),
+                                    padding = "same",
+                                    use_bias = False,
+                                    kernel_initializer = "he_uniform")
     self.A_old = A_old
     self.MgSmooth = MgSmooth(self.iterations, u_channels, f_channels)
 
-    self.Pi_bn = tf.keras.layers.BatchNormalization(axis = 1)
-    self.R_bn = tf.keras.layers.BatchNormalization(axis = 1)
+    self.Pi_bn = tf.keras.layers.BatchNormalization()
+    self.R_bn = tf.keras.layers.BatchNormalization()
 
   def call(self, u0, f0):
     u1 = tf.nn.relu(self.Pi_bn(self.Pi(u0)))
-    error = tf.nn.relu(self.R_bn(self.Pi(f0 - self.A_old(u0))))
+    error = tf.nn.relu(self.R_bn(self.R(f0 - self.A_old(u0))))
     f1 = error + self.MgSmooth.A(u1)
     u, f = self.MgSmooth(u1, f1)
     return u, f
@@ -99,25 +140,38 @@ class MgNet(tf.keras.Model):
 
     self.iterations = iterations
     self.in_shape = in_shape
-    self.A_init = tf.keras.layers.Conv2D(u_channels[0], (3, 3), strides = (1, 1), padding = "same", use_bias = False)
-    self.A_bn = tf.keras.layers.BatchNormalization(axis = 1)
+    self.A_init = tf.keras.layers.Conv2D(u_channels[0],
+                                         (3, 3),
+                                         strides = (1, 1),
+                                         padding = "same",
+                                         use_bias = False,
+                                         kernel_initializer = "he_uniform")
+    self.A_bn = tf.keras.layers.BatchNormalization()
 
-    self.A0 = tf.keras.layers.Conv2D(u_channels[0], (3, 3), strides = (1, 1), padding = "same", use_bias = False)
     self.blocks = []
     for i in range(len(self.iterations)):
       if i == 0:
-        self.blocks.append(MgSmooth(iterations[i], u_channels[i], f_channels[i]))
+        self.blocks.append(MgSmooth(iterations[i],
+                                    u_channels[i],
+                                    f_channels[i]))
         continue
       if i == 1:
-        self.blocks.append(MgBlock(iterations[i], u_channels[i], f_channels[i], self.A0))
+        self.blocks.append(MgBlock(iterations[i],
+                                   u_channels[i],
+                                   f_channels[i],
+                                   self.blocks[0].A))
         continue
-      self.blocks.append(MgBlock(iterations[i], u_channels[i], f_channels[i], self.blocks[i - 1].MgSmooth.A))
+      self.blocks.append(MgBlock(iterations[i],
+                                 u_channels[i],
+                                 f_channels[i],
+                                 self.blocks[i - 1].MgSmooth.A))
 
     x = in_shape[0]
     for i in range(len(self.blocks) - 1):
       x = ((x + 2 - 3) // 2) + 1
     self.pool = tf.keras.layers.AveragePooling2D(pool_size = (x, x))
-    self.softmax = tf.keras.layers.Dense(out_shape, activation = "softmax")
+    self.fc = tf.keras.layers.Dense(out_shape,
+                                    activation = "softmax")
   
   def call(self, u0):
     f = tf.nn.relu(self.A_bn(self.A_init(u0)))
@@ -127,9 +181,11 @@ class MgNet(tf.keras.Model):
       u, f = block(u, f)
     u = self.pool(u)
     u = tf.squeeze(u, [-2, -3])
-    u = self.softmax(u)
+    u = self.fc(u)
     return u
-  
+
+
+
 tf.debugging.set_log_device_placement(True)
 gpus = tf.config.list_logical_devices("GPU")
 strategy = tf.distribute.MirroredStrategy(gpus)
@@ -149,6 +205,8 @@ with strategy.scope():
                       validation_data = ds_test)
 
 model.summary()
+
+
 
 if graph:
   loss = history.history["loss"]
