@@ -327,30 +327,3 @@ with strategy.scope():
                                    tensorboard_callback])
 
 model.summary()
-
-
-
-if graph:
-  loss = history.history["loss"]
-  accuracy = history.history["accuracy"]
-  val_loss = history.history["val_loss"]
-  val_accuracy = history.history["val_accuracy"]
-  timerange = range(len(loss))
-
-  fig,ax = plt.subplots()
-  train_loss_plot, = ax.plot(timerange, loss, color = "blue")
-  val_loss_plot, = ax.plot(timerange, val_loss, color = "cyan")
-  train_loss_plot.set_label("Train Loss")
-  val_loss_plot.set_label("Validation Loss")
-  ax.set_xlabel("Epoch")
-  ax.set_ylabel("Loss")
-  ax.legend(loc = "upper left")
-  ax2 = ax.twinx()
-  train_acc_plot, = ax2.plot(timerange, accuracy, color = "purple")
-  val_acc_plot, = ax2.plot(timerange, val_accuracy, color = "pink")
-  train_acc_plot.set_label("Train Accuracy")
-  val_acc_plot.set_label("Validation Accuracy")
-  ax2.set_ylabel("Accuracy")
-  ax2.legend(loc = "upper right")
-  plt.title("Loss vs Accuracy")
-  plt.savefig(f"{dataset}_mgnet_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.png")
