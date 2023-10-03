@@ -1,2 +1,2 @@
 # MgNet_SCAN
-In this repository, we aim to combine Prof. Jinchao Xu's MgNet framework with the popular SCAN distillation framework.  We then observe its performance as well as future investigation opportunities.
+In this repository, we aim to combine Prof. Jinchao Xu's MgNet framework with the popular SCAN distillation framework.  We then observe its performance as well as future investigation opportunities.  We also investigate some implementation differences between TensorFlow and PyTorch, how it leads to a sometimes signifcant performance differential, which eventually gives rise to the tfe (TensorFlow Extras) library.
